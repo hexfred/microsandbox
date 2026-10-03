@@ -821,7 +821,8 @@ mod tests {
                     "user_id": "employee"
                 },
                 "metrics_sample_interval_ms": 2500,
-                "disable_metrics_sample": true
+                "disable_metrics_sample": true,
+                "disable_exec_log": true
             },
             "runtime": {
                 "block_writeback": {"mode": "fixed", "per_disk_mib": 1280, "pool_mib": 5120},
