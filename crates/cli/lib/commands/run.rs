@@ -71,6 +71,9 @@ struct ExecOpts {
     timeout: Option<Duration>,
     rlimits: Vec<(RlimitResource, u64, u64)>,
     detach_keys: Option<String>,
+    /// Record the command to `exec.log`. Set only when `run` created the
+    /// sandbox, so the command is its workload; left unset otherwise.
+    capture: bool,
 }
 
 impl ExecOpts {
@@ -92,6 +95,7 @@ impl ExecOpts {
             timeout,
             rlimits,
             detach_keys: args.detach_keys.clone(),
+            capture: false,
         })
     }
 }
@@ -241,7 +245,12 @@ async fn run_new(
         return Ok(());
     }
 
-    let exec_opts = ExecOpts::parse(&args)?;
+    // This sandbox was created for the command, so the command is its
+    // workload: ask for capture, as the runtime does for a startup command.
+    let exec_opts = ExecOpts {
+        capture: true,
+        ..ExecOpts::parse(&args)?
+    };
     let interactive =
         common::use_interactive_tty(io::stdin().is_terminal(), args.no_tty || args.no_stdin);
 
@@ -347,9 +356,12 @@ async fn exec_in_sandbox(
     interactive: bool,
     opts: &ExecOpts,
 ) -> anyhow::Result<i32> {
-    // An attached `msb run` runs the workload here rather than as the
+    // A new sandbox's `msb run` runs the workload here rather than as the
     // runtime's startup command, so it asks for capture itself: `msb logs`
-    // shows a sandbox's workload whichever way it was started.
+    // shows a sandbox's workload whichever way it was started. A command run
+    // in an existing sandbox is not its workload, so capture stays unset
+    // there (an explicit `false` would fail on an older runtime).
+    let capture = opts.capture;
     if interactive {
         let rlimits = opts.rlimits.clone();
         let detach_keys = opts.detach_keys.clone();
@@ -360,7 +372,10 @@ async fn exec_in_sandbox(
             if has_opts {
                 Ok(sandbox
                     .attach_with(cmd, |a| {
-                        let mut a = a.args(cmd_args).capture(true);
+                        let mut a = a.args(cmd_args);
+                        if capture {
+                            a = a.capture(true);
+                        }
                         for (resource, soft, hard) in rlimits {
                             a = a.rlimit_range(resource, soft, hard);
                         }
@@ -372,7 +387,10 @@ async fn exec_in_sandbox(
                     .await?)
             } else {
                 Ok(sandbox
-                    .attach_with(cmd, |a| a.args(cmd_args).capture(true))
+                    .attach_with(cmd, |a| {
+                        let a = a.args(cmd_args);
+                        if capture { a.capture(true) } else { a }
+                    })
                     .await?)
             }
         };
@@ -392,7 +410,10 @@ async fn exec_in_sandbox(
         let output: ExecOutput = if has_opts {
             sandbox
                 .exec_with(cmd, |e| {
-                    let mut e = e.args(cmd_args).capture(true);
+                    let mut e = e.args(cmd_args);
+                    if capture {
+                        e = e.capture(true);
+                    }
                     if opts.no_stdin {
                         e = e.stdin_bytes(Vec::new());
                     }
@@ -410,7 +431,10 @@ async fn exec_in_sandbox(
                 .await?
         } else {
             sandbox
-                .exec_with(cmd, |e| e.args(cmd_args).capture(true))
+                .exec_with(cmd, |e| {
+                    let e = e.args(cmd_args);
+                    if capture { e.capture(true) } else { e }
+                })
                 .await?
         };
 
@@ -682,6 +706,16 @@ mod tests {
         let args = parse_run_args(&["--name", "box", "alpine", "--", "echo", "hello"]);
 
         assert_eq!(ignored_existing_inputs(&args), None);
+    }
+
+    #[test]
+    fn a_command_in_an_existing_sandbox_is_not_captured_by_default() {
+        let opts = ExecOpts::parse(&parse_run_args(&["--name", "box", "alpine"])).unwrap();
+
+        assert!(
+            !opts.capture,
+            "only run_new marks its command as the workload"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ msb logs devbox --source all
 
 ## What is recorded
 
-`exec.log` records the sandbox's **workload**: the command a detached `msb run` starts, the foreground command of an attached `msb run`, and the SDK's `exec_default` / `attach_default`. Other exec sessions (`msb exec`, an SDK `exec` or `attach`, and interactive shells above all) are **not** recorded unless they ask. A shell's transcript can carry anything typed or printed, and every chunk of it would otherwise be written to the host's disk.
+`exec.log` records the sandbox's **workload**: the command a detached `msb run` starts, the foreground command of an attached `msb run` that creates the sandbox, and the SDK's `exec_default` / `attach_default`. Other exec sessions (`msb exec`, `msb run` in a sandbox that already exists, an SDK `exec` or `attach`, and interactive shells above all) are **not** recorded unless they ask. A shell's transcript can carry anything typed or printed, and every chunk of it would otherwise be written to the host's disk.
 
 ```bash
 msb exec devbox --capture -- ./migrate.sh
