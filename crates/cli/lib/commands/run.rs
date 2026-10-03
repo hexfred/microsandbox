@@ -685,6 +685,13 @@ mod tests {
     }
 
     #[test]
+    fn existing_reuse_warns_that_no_exec_log_is_ignored() {
+        let args = parse_run_args(&["--name", "box", "--no-exec-log", "alpine"]);
+
+        assert_eq!(ignored_existing_inputs(&args), Some("creation flags"));
+    }
+
+    #[test]
     fn existing_reuse_cannot_silently_ignore_a_snapshot_source() {
         assert!(
             TestCli::try_parse_from([

@@ -1094,6 +1094,7 @@ impl SandboxOpts {
             || self.max_duration.is_some()
             || self.idle_timeout.is_some()
             || self.security.is_some()
+            || self.no_exec_log
             || !self.vsock.is_empty();
 
         #[cfg(feature = "net")]
