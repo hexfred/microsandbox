@@ -201,9 +201,13 @@
               "cli/overview",
               "cli/configuration",
               "cli/sandbox-commands",
+              "cli/snapshot-commands",
               "cli/ssh-commands",
               "cli/volume-commands",
-              "cli/image-commands"
+              "cli/storage-commands",
+              "cli/image-commands",
+              "cli/registry-commands",
+              "cli/management"
             ]
           }
         ]
@@ -265,6 +269,7 @@
             "icon": "code",
             "pages": [
               "examples/development/vscode",
+              "examples/development/jetbrains-acp",
               "examples/development/code-server",
               "examples/development/jupyterlab",
               "examples/development/vnc-desktop"
@@ -332,6 +337,14 @@
               "examples/metrics-backends/datadog"
             ]
           }
+        ]
+      },
+      {
+        "tab": "Enterprise",
+        "pages": [
+          "enterprise/managed-configuration",
+          "enterprise/corporate-networking",
+          "enterprise/offline-deployment"
         ]
       },
       {

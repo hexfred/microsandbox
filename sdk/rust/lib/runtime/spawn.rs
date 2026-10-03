@@ -23,6 +23,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs::File,
+    future::Future,
     io::{Seek, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     process::Stdio,
@@ -78,6 +79,7 @@ use crate::error::{Operation, UnsupportedReason};
 #[cfg(windows)]
 use crate::runtime::handle::WindowsJob;
 use crate::runtime::handle::{ProcessHandle, StartupProcess};
+use crate::runtime::launch_contract::{self, LaunchContract};
 use crate::timing;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
@@ -311,8 +313,7 @@ pub async fn spawn_sandbox(
         .resolve(&EnvNetworkSecretResolver)
         .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
 
-    // Resolve msb and libkrunfw as one pair so a partial or mixed-version
-    // installation cannot reach process launch.
+    // Resolve the already-layered runtime paths as one compatible pair before launch.
     let global = local.config();
     #[cfg(feature = "embed-binaries")]
     let resolved_runtime = crate::setup::ensure_runtime(
@@ -326,28 +327,30 @@ pub async fn spawn_sandbox(
     #[cfg(not(feature = "embed-binaries"))]
     let resolved_runtime = crate::setup::resolve_runtime(global)?;
     ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
-    let launch_contract = super::launch_contract::resolve(&resolved_runtime.msb_path).await?;
+    let launch_contract = launch_contract::resolve(&resolved_runtime.msb_path).await?;
     // A stopped sandbox may have been edited without a runtime installed, or
     // the selected executable may have changed since creation. Validate its
     // effective configuration here for both initial launch and later starts.
-    crate::db::writing::validate_runtime_config(config, global).await?;
+    launch_contract.validate_launch_intent(config)?;
+    #[cfg(feature = "net")]
+    launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
             .iter()
             .any(|binding| binding.require_backing)
     }) {
-        super::launch_contract::require_restore_backing(&resolved_runtime.msb_path).await?;
+        launch_contract::require_restore_backing(&resolved_runtime.msb_path).await?;
     }
     if config.spec.runtime.disable_exec_log {
-        super::launch_contract::require_disable_exec_log(&resolved_runtime.msb_path).await?;
+        launch_contract::require_disable_exec_log(&resolved_runtime.msb_path).await?;
     }
-    launch_contract.validate_capacity(
-        config.spec.resources.cpus,
-        config.spec.resources.max_cpus,
-        config.spec.resources.memory_mib,
-        config.spec.resources.max_memory_mib,
-    )?;
+    // Create already probed before replacing; a later start may use a different runtime.
+    #[cfg(feature = "net")]
+    launch_contract
+        .require_network_capabilities(&resolved_runtime.msb_path, resolved_network.config())
+        .await?;
     if launch_contract.patch < 9
         && !matches!(
             global.runtime.block_writeback,
@@ -635,7 +638,7 @@ pub async fn spawn_sandbox(
     if !launch_contract.machine {
         visible[0] = OsString::from("sandbox");
     }
-    let launch_value = match super::launch_input::encode(&launch, launch_contract) {
+    let launch_value = match launch_contract.encode(&launch) {
         Ok(launch) => launch,
         Err(error) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
@@ -692,13 +695,11 @@ pub async fn spawn_sandbox(
     cmd.args(visible);
 
     // Agentd selection is process-wide for the VMM. Forward the explicit
-    // environment override first, otherwise map the backend-owned global
-    // config into the child environment. The child validates and eagerly
+    // path from the resolved backend config into the child environment.
+    // Managed clears also remove inherited overrides. The child validates and eagerly
     // reads the selected payload before constructing any filesystem.
-    if let Some(path) = agentd_path_override(
-        std::env::var_os("MSB_AGENTD_PATH"),
-        global.paths.agentd.as_deref(),
-    ) {
+    cmd.env_remove("MSB_AGENTD_PATH");
+    if let Some(path) = &global.paths.agentd {
         cmd.env("MSB_AGENTD_PATH", path);
     }
 
@@ -1618,7 +1619,11 @@ pub(crate) async fn ensure_named_volumes(
     local: &LocalBackend,
     config: &SandboxConfig,
 ) -> MicrosandboxResult<EnsuredNamedVolumes> {
-    let locks = lock_named_volume_mounts(local, config).await?;
+    let locks = lock_named_volume_mounts(config, |name| async move {
+        lock_volume_name(local, &name).await
+    })
+    .await?;
+
     let mut created = Vec::new();
 
     if let Err(err) = ensure_named_volumes_inner(local, config, &mut created).await {
@@ -1759,10 +1764,13 @@ async fn rollback_created_named_volume_records(
     }
 }
 
-async fn lock_named_volume_mounts(
-    local: &LocalBackend,
+async fn lock_named_volume_mounts<Guard, Acquire>(
     config: &SandboxConfig,
-) -> MicrosandboxResult<Vec<File>> {
+    mut acquire: impl FnMut(String) -> Acquire,
+) -> MicrosandboxResult<Vec<Guard>>
+where
+    Acquire: Future<Output = MicrosandboxResult<Guard>>,
+{
     let mut names = BTreeSet::new();
     for mount in &config.spec.mounts {
         if let VolumeMount::Named { name, .. } = mount {
@@ -1773,7 +1781,7 @@ async fn lock_named_volume_mounts(
 
     let mut locks = Vec::with_capacity(names.len());
     for name in names {
-        locks.push(lock_volume_name(local, &name).await?);
+        locks.push(acquire(name).await?);
     }
     Ok(locks)
 }
@@ -2234,7 +2242,7 @@ fn sandbox_agent_socket_path_candidates_with_roots(
 fn launch_agent_socket_path(
     local: &LocalBackend,
     name: &str,
-    contract: super::launch_contract::LaunchContract,
+    contract: LaunchContract,
 ) -> MicrosandboxResult<PathBuf> {
     #[cfg(unix)]
     if contract.patch < 9 {
@@ -2725,14 +2733,6 @@ fn append_option_block(spec: &mut String, opts: Vec<String>) {
     spec.push_str(&opts.join(","));
 }
 
-/// Resolve the process-wide Agentd path without consulting the filesystem.
-fn agentd_path_override(
-    environment: Option<OsString>,
-    configured: Option<&Path>,
-) -> Option<OsString> {
-    environment.or_else(|| configured.map(Path::as_os_str).map(OsString::from))
-}
-
 /// Derive a stable, collision-resistant identifier from a guest mount path.
 ///
 /// Used for virtiofs tags and for virtio-blk `serial` fields (the block id
@@ -2868,6 +2868,7 @@ fn machine_cli_args(
         agent_sock: agent_sock_path.to_path_buf(),
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
+        guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
@@ -2886,52 +2887,7 @@ fn machine_cli_args(
         }),
         #[cfg(feature = "net")]
         deployment_profile: config.spec.deployment_profile,
-        bootstrap: GuestBootstrap {
-            hostname: Some(
-                config.spec.runtime.hostname.clone().unwrap_or_else(|| {
-                    crate::sandbox::hostname_from_sandbox_name(&config.spec.name)
-                }),
-            ),
-            rlimits: config
-                .spec
-                .rlimits
-                .iter()
-                .map(|rlimit| ExecRlimit {
-                    resource: rlimit.resource.as_str().to_string(),
-                    soft: rlimit.soft,
-                    hard: rlimit.hard,
-                })
-                .collect(),
-            user: config.spec.runtime.user.clone(),
-            default_cwd: config.spec.runtime.workdir.clone(),
-            default_env: config
-                .spec
-                .env
-                .iter()
-                .map(|var| BootstrapEnvVar {
-                    key: var.key.clone(),
-                    value: var.value.clone(),
-                })
-                .collect(),
-            security_profile: match config.spec.security_profile {
-                crate::sandbox::SecurityProfile::Default => BootstrapSecurityProfile::Default,
-                crate::sandbox::SecurityProfile::Restricted => BootstrapSecurityProfile::Restricted,
-            },
-            handoff_init: config.spec.init.as_ref().map(|init| BootstrapHandoffInit {
-                cmd: init.cmd.clone(),
-                args: init.args.clone(),
-                cwd: config.spec.runtime.workdir.clone(),
-                env: init
-                    .env
-                    .iter()
-                    .map(|(key, value)| BootstrapEnvVar {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-            }),
-            ..GuestBootstrap::default()
-        },
+        bootstrap: guest_bootstrap(config),
         ..Default::default()
     };
 
@@ -3271,6 +3227,59 @@ fn machine_cli_args(
     (visible, launch)
 }
 
+/// Build guest settings shared by launch preflight and the final payload.
+pub(crate) fn guest_bootstrap(config: &SandboxConfig) -> GuestBootstrap {
+    GuestBootstrap {
+        hostname: Some(
+            config
+                .spec
+                .runtime
+                .hostname
+                .clone()
+                .unwrap_or_else(|| crate::sandbox::hostname_from_sandbox_name(&config.spec.name)),
+        ),
+        rlimits: config
+            .spec
+            .rlimits
+            .iter()
+            .map(|rlimit| ExecRlimit {
+                resource: rlimit.resource.as_str().to_string(),
+                soft: rlimit.soft,
+                hard: rlimit.hard,
+            })
+            .collect(),
+        user: config.spec.runtime.user.clone(),
+        default_cwd: config.spec.runtime.workdir.clone(),
+        default_env: config
+            .spec
+            .env
+            .iter()
+            .map(|var| BootstrapEnvVar {
+                key: var.key.clone(),
+                value: var.value.clone(),
+            })
+            .collect(),
+        security_profile: match config.spec.security_profile {
+            crate::sandbox::SecurityProfile::Default => BootstrapSecurityProfile::Default,
+            crate::sandbox::SecurityProfile::Restricted => BootstrapSecurityProfile::Restricted,
+        },
+        handoff_init: config.spec.init.as_ref().map(|init| BootstrapHandoffInit {
+            cmd: init.cmd.clone(),
+            args: init.args.clone(),
+            cwd: config.spec.runtime.workdir.clone(),
+            env: init
+                .env
+                .iter()
+                .map(|(key, value)| BootstrapEnvVar {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }),
+        ..GuestBootstrap::default()
+    }
+}
+
 fn startup_command(config: &SandboxConfig) -> Option<StartupCommand> {
     let (cmd, cmd_args) = resolve_startup_command(config)?;
     Some(StartupCommand {
@@ -3347,9 +3356,7 @@ mod tests {
         AUTO_BLOCK_WRITEBACK_LIMIT_BYTES, MIN_BLOCK_WRITEBACK_LIMIT_BYTES,
         auto_block_writeback_pool_bytes, resolve_linux_block_writeback_policy,
     };
-    use super::{
-        agentd_path_override, block_writeback_policy, is_owned_restored_disk, machine_cli_args,
-    };
+    use super::{block_writeback_policy, is_owned_restored_disk, machine_cli_args};
     use crate::{
         LogLevel,
         backend::LocalBackend,
@@ -3359,6 +3366,9 @@ mod tests {
             RootfsSource, SandboxBuilder, SandboxConfig, StatVirtualization, VolumeMount,
         },
         volume::VolumeKind,
+    };
+    use crate::{
+        SandboxConfigPatch, backend::BackendSelectionSource, config::layers::BackendConfig,
     };
 
     #[test]
@@ -4044,11 +4054,16 @@ mod tests {
     // Functions: Helpers
     //----------------------------------------------------------------------------------------------
 
-    /// Build a `LocalBackend` for tests. Uses `lazy()` since these tests only
-    /// exercise the pure-rendering `machine_cli_args` path — no DB / FS
-    /// touches.
+    /// Use isolated configuration for pure `machine_cli_args` rendering tests.
+    /// The database remains unopened.
     fn test_local_backend() -> LocalBackend {
-        LocalBackend::lazy()
+        LocalBackend::from_backend_config(
+            BackendConfig::new(Default::default(), Default::default())
+                .prepare_for_local_backend(Default::default())
+                .unwrap(),
+            BackendSelectionSource::Programmatic,
+            None,
+        )
     }
 
     #[cfg(feature = "net")]
@@ -4092,25 +4107,6 @@ mod tests {
             None,
         );
         launch
-    }
-
-    #[test]
-    fn agentd_environment_override_wins_over_global_config() {
-        assert_eq!(
-            agentd_path_override(
-                Some(OsString::from("/from/environment")),
-                Some(Path::new("/from/config")),
-            ),
-            Some(OsString::from("/from/environment"))
-        );
-    }
-
-    #[test]
-    fn agentd_global_config_is_used_without_environment_override() {
-        assert_eq!(
-            agentd_path_override(None, Some(Path::new("/from/config"))),
-            Some(OsString::from("/from/config"))
-        );
     }
 
     /// Re-expand a [`LaunchConfig`] into the historical `--flag value` token
@@ -4628,7 +4624,9 @@ mod tests {
             .await
             .unwrap();
         config.spec.runtime.cmd = Some(vec!["bash".to_string()]);
-        config.set_background_command(Vec::new());
+        let mut patch = SandboxConfigPatch::new();
+        patch.set_background_command(Vec::new());
+        patch.apply_to(&mut config);
 
         let rendered = render_args(&config);
 
@@ -4713,7 +4711,13 @@ mod tests {
     async fn test_agent_socket_candidates_follow_explicit_local_backend_paths() {
         let temp = tempdir().unwrap();
         let home = temp.path().join("msb-home");
-        let backend = LocalBackend::builder().home(&home).build().await.unwrap();
+        let backend = LocalBackend::builder()
+            .config_path(home.join("config.json"))
+            .managed_config_path(home.join("managed.json"))
+            .home(&home)
+            .build()
+            .await
+            .unwrap();
 
         let candidates =
             super::sandbox_agent_socket_path_candidates_for(&backend, "sdk-socket-test");
@@ -4761,7 +4765,13 @@ mod tests {
         #[cfg(not(unix))]
         let temp = tempfile::Builder::new().prefix("msb").tempdir().unwrap();
         let home = temp.path().join("msb-home");
-        let backend = LocalBackend::builder().home(&home).build().await.unwrap();
+        let backend = LocalBackend::builder()
+            .config_path(home.join("config.json"))
+            .managed_config_path(home.join("managed.json"))
+            .home(&home)
+            .build()
+            .await
+            .unwrap();
 
         let resolved =
             super::resolve_sandbox_agent_socket_path_for(&backend, "sdk-socket-test").unwrap();
@@ -5822,6 +5832,8 @@ mod tests {
         std::fs::create_dir_all(&volumes_dir).unwrap();
         std::fs::write(volumes_dir.join("broken"), b"not a directory").unwrap();
         let local = LocalBackend::builder()
+            .config_path(home.join("config.json"))
+            .managed_config_path(home.join("managed.json"))
             .home(&home)
             .volumes_dir(&volumes_dir)
             .build()
@@ -5853,53 +5865,58 @@ mod tests {
 
     #[tokio::test]
     async fn named_volume_waiter_yields_and_cancellation_releases_partial_locks() {
-        use microsandbox_utils::process_lock::try_lock_exclusive;
+        use std::cell::RefCell;
 
-        let directory = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(directory.path().join("home"))
-            .build()
-            .await
-            .unwrap();
-        let winner = crate::volume::lock_volume_name(&local, "z-shared")
-            .await
-            .unwrap();
+        use tokio::sync::oneshot;
+
         let config = SandboxBuilder::new("waiter")
             .image("/tmp/rootfs")
             // Deliberately reverse the mount order: acquisition must still take a-first
             // before waiting for z-shared, and cancellation must release that partial set.
             .volume("/shared", |mount| mount.named("z-shared"))
             .volume("/first", |mount| mount.named("a-first"))
+            .volume("/first-again", |mount| mount.named("a-first"))
             .build()
             .await
             .unwrap();
-        let mut waiter = Box::pin(super::lock_named_volume_mounts(&local, &config));
+        // Dropping the sender reports guard release without OS locks that unrelated
+        // parallel tests can inherit between fork and exec.
+        let (first_guard, mut first_released) = oneshot::channel::<()>();
+        let mut first_guard = Some(first_guard);
+        let attempts = RefCell::new(Vec::new());
+        let mut waiter = Box::pin(super::lock_named_volume_mounts(&config, |name| {
+            attempts.borrow_mut().push(name.clone());
+            let guard = match name.as_str() {
+                "a-first" => Some(first_guard.take().expect("lock acquired only once")),
+                "z-shared" => None,
+                _ => panic!("unexpected volume: {name}"),
+            };
+            async move {
+                match guard {
+                    Some(guard) => Ok(guard),
+                    None => std::future::pending().await,
+                }
+            }
+        }));
+
+        // One poll must yield at the contended second lock while retaining the first.
         assert!(futures::poll!(waiter.as_mut()).is_pending());
-        let first_probe = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(local.volumes_dir().join(".locks/a-first.lock"))
-            .unwrap();
-        assert!(!try_lock_exclusive(&first_probe).unwrap());
-        // This is a current-thread runtime. The timer can fire only if the contended
-        // lock yields instead of blocking the task that also owns the winning create.
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), waiter.as_mut())
-                .await
-                .is_err()
+        assert_eq!(*attempts.borrow(), ["a-first", "z-shared"]);
+        assert_eq!(
+            first_released.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
         );
+
         drop(waiter);
-        assert!(try_lock_exclusive(&first_probe).unwrap());
-        drop(first_probe);
-        drop(winner);
-        let locks = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            super::lock_named_volume_mounts(&local, &config),
-        )
-        .await
-        .expect("cancelled waiter retained a volume lock")
-        .unwrap();
-        assert_eq!(locks.len(), 2);
+        assert_eq!(
+            first_released.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+
+        let locks = super::lock_named_volume_mounts(&config, |name| std::future::ready(Ok(name)))
+            .await
+            .unwrap();
+        assert_eq!(locks, ["a-first", "z-shared"]);
     }
 
     #[tokio::test]
@@ -5908,6 +5925,8 @@ mod tests {
         let home = temp.path().join("home");
         let volumes_dir = temp.path().join("volumes");
         let local = LocalBackend::builder()
+            .config_path(home.join("config.json"))
+            .managed_config_path(home.join("managed.json"))
             .home(&home)
             .volumes_dir(&volumes_dir)
             .build()
@@ -5950,6 +5969,8 @@ mod tests {
     async fn test_resolve_named_volumes_recovers_disk_metadata_from_store() {
         let temp = tempdir().unwrap();
         let local = LocalBackend::builder()
+            .config_path(temp.path().join("config.json"))
+            .managed_config_path(temp.path().join("managed.json"))
             .home(temp.path())
             .build()
             .await
@@ -6007,6 +6028,8 @@ mod tests {
     async fn test_existing_named_volume_mode_does_not_validate_default_metadata() {
         let temp = tempdir().unwrap();
         let local = LocalBackend::builder()
+            .config_path(temp.path().join("config.json"))
+            .managed_config_path(temp.path().join("managed.json"))
             .home(temp.path())
             .build()
             .await

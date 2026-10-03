@@ -10,11 +10,14 @@ use std::path::{Path, PathBuf};
 /// The directory holds the canonical descriptor and complete local payload closure.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    pub(super) lease: Option<microsandbox_image::storage_lease::StorageLease>,
     pub(super) path: PathBuf,
     pub(super) digest: String,
     pub(super) manifest: Manifest,
     pub(super) labels: BTreeMap<String, String>,
     pub(super) head_update: Option<HeadUpdate>,
+    /// Exact payload named by a previous flat descriptor, without rewriting its source.
+    pub(super) previous_upper: Option<PathBuf>,
 }
 
 impl Snapshot {
@@ -65,6 +68,8 @@ impl Snapshot {
         ));
         if canonical.exists() {
             canonical
+        } else if let Some(path) = &self.previous_upper {
+            path.clone()
         } else if self
             .manifest
             .state
@@ -137,11 +142,13 @@ impl Snapshot {
         labels: BTreeMap<String, String>,
     ) -> Self {
         Self {
+            lease: None,
             path,
             digest,
             manifest,
             labels,
             head_update: None,
+            previous_upper: None,
         }
     }
 }

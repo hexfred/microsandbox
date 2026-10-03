@@ -22,7 +22,6 @@ use crate::{
     SnapshotArtifactKind, SnapshotSourceRecoveryError, UnsupportedReason,
 };
 
-use super::store::index_upsert;
 use super::{Snapshot, SnapshotArchive, SnapshotConfig};
 
 //--------------------------------------------------------------------------------------------------
@@ -194,7 +193,11 @@ async fn publish_snapshot_group(
     write_descriptor(captured.path(), &descriptor).await?;
     // Publication owns its staging and ancestry sequencer. Dropping an SDK future must not
     // release the source lock while a blocking group commit is still running in the background.
+    let publication_db = local.db().await?.write().clone();
     let captured = tokio::spawn(async move {
+        let destination = group_dir.join(captured.id().as_str());
+        let _publication = microsandbox_image::storage_lease::StorageLease::shared_async(destination.clone()).await?;
+        super::publication::prepare(&publication_db, &destination, captured.digest(), captured.manifest()).await?;
         let update = publish_with_name_retry(
             &group_dir,
             staging.path(),
@@ -204,21 +207,13 @@ async fn publish_snapshot_group(
             || format!("msb-{:08x}", rand::random::<u32>()),
         ).await?;
         captured.path = group_dir.join(captured.id().as_str());
+        super::publication::complete(&publication_db, captured.path(), captured.digest(), captured.manifest()).await?;
+        captured.lease = Some(super::lease::reader_async(captured.path.clone()).await?);
         lineage.commit(captured.id()).await?;
         tracing::info!(group = %update.group, head = %update.head, reason = ?update.reason, "snapshot group publication");
         captured.head_update = Some(update);
         Ok::<_, MicrosandboxError>(captured)
     }).await.map_err(|error| MicrosandboxError::Runtime(format!("snapshot publication task: {error}")))??;
-    if let Err(error) = index_upsert(
-        local,
-        captured.path(),
-        captured.digest(),
-        captured.manifest(),
-    )
-    .await
-    {
-        tracing::warn!(%error, "snapshot index update failed after group publication");
-    }
     Ok(captured)
     }.await;
     finish_capture(published, source_recovery, installed_artifact)
@@ -982,6 +977,9 @@ async fn capture_full_snapshot(
         manifest.set_restore_defaults(microsandbox_image::snapshot::RestoreDefaults {
             user: sandbox_config.spec.runtime.user.clone(),
         })?;
+        // Captured execution carries its own guest timeline; keep the source's clock policy
+        // so restores do not step that timeline to host time unless they ask to.
+        manifest.set_guest_clock(sandbox_config.spec.runtime.guest_clock.unwrap_or_default())?;
         manifest.set_owned_volumes(closure.checkpoint().owned_volumes.clone())?;
         manifest
             .validate()
@@ -1405,7 +1403,7 @@ async fn capture_disk_source(
         .filter(sandbox_entity::Column::Name.eq(source))
         .one(local.db().await?.read())
         .await?;
-    if !current.is_some_and(|model| model.id == source_id) {
+    if current.is_none_or(|model| model.id != source_id) {
         return Err(MicrosandboxError::Runtime(
             "snapshot source was replaced during disk capture; retry with the current sandbox"
                 .into(),
@@ -2002,6 +2000,29 @@ async fn promote_snapshot_directory(
     destination: &Path,
     force: bool,
 ) -> MicrosandboxResult<()> {
+    let staging = staging.to_path_buf();
+    let destination = destination.to_path_buf();
+    if !force && tokio::fs::symlink_metadata(&destination).await.is_ok() {
+        return Err(MicrosandboxError::SnapshotAlreadyExists(
+            destination.display().to_string(),
+        ));
+    }
+    let lease = super::lease::deletion(&destination)?.ok_or_else(|| {
+        MicrosandboxError::Custom("snapshot is in use by an active operation".into())
+    })?;
+    tokio::spawn(async move {
+        let _lease = lease;
+        promote_snapshot_directory_inner(&staging, &destination, force).await
+    })
+    .await
+    .map_err(|error| MicrosandboxError::Custom(format!("snapshot promotion task: {error}")))?
+}
+
+async fn promote_snapshot_directory_inner(
+    staging: &Path,
+    destination: &Path,
+    force: bool,
+) -> MicrosandboxResult<()> {
     let parent = destination.parent().ok_or_else(|| {
         MicrosandboxError::InvalidConfig(format!(
             "snapshot destination has no parent directory: {}",
@@ -2382,8 +2403,7 @@ mod tests {
             "workload thaw timed out; re-pause failed",
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let local = LocalBackend::builder()
-                .home(temp.path().join("home"))
+            let local = crate::test_support::local_backend_builder(temp.path().join("home"))
                 .build()
                 .await
                 .unwrap();
@@ -2481,8 +2501,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_failure_preserves_published_archive() {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(temp.path().join("home"))
+        let local = crate::test_support::local_backend_builder(temp.path().join("home"))
             .build()
             .await
             .unwrap();
@@ -2532,8 +2551,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_failure_keeps_original_artifact_and_both_diagnostics_on_publication_error() {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(temp.path().join("home"))
+        let local = crate::test_support::local_backend_builder(temp.path().join("home"))
             .build()
             .await
             .unwrap();
@@ -2593,8 +2611,7 @@ mod tests {
     #[tokio::test]
     async fn successful_source_recovery_keeps_existing_success_result() {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(temp.path().join("home"))
+        let local = crate::test_support::local_backend_builder(temp.path().join("home"))
             .build()
             .await
             .unwrap();
@@ -2742,8 +2759,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stopped_capture_dispatches_owned_chains_off_the_async_executor() {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(temp.path().join("home"))
+        let local = crate::test_support::local_backend_builder(temp.path().join("home"))
             .build()
             .await
             .unwrap();
@@ -2823,8 +2839,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let temp = tempfile::tempdir().unwrap();
-                let local = LocalBackend::builder()
-                    .home(temp.path().join("home"))
+                let local = crate::test_support::local_backend_builder(temp.path().join("home"))
                     .build()
                     .await
                     .unwrap();
@@ -3025,8 +3040,7 @@ mod tests {
         ] {
             for record_integrity in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
-                let local = LocalBackend::builder()
-                    .home(temp.path().join("home"))
+                let local = crate::test_support::local_backend_builder(temp.path().join("home"))
                     .build()
                     .await
                     .unwrap();

@@ -5,7 +5,7 @@ use microsandbox::LogLevel;
 
 use super::{
     branch, copy, create, exec, inspect, list, logs, metrics, modify, pause, ping, ps, remove,
-    restart, restore, run, start, stop, touch,
+    restart, restore, run, start, stop, touch, wait,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -46,14 +46,18 @@ pub enum SandboxCommands {
     /// Suspend a resident sandbox without creating a snapshot.
     Pause(pause::PauseArgs),
 
-    /// Branch running execution into a new local CoW child without a durable full snapshot.
-    Branch(branch::BranchArgs),
+    /// Fork running execution into a new local CoW child without a durable full snapshot.
+    #[command(name = "fork", alias = "branch")]
+    Fork(branch::BranchArgs),
 
     /// Resume a user-paused resident sandbox.
     Resume(pause::ResumeArgs),
 
     /// Restart one or more sandboxes.
     Restart(restart::RestartArgs),
+
+    /// Wait for a sandbox to stop or crash.
+    Wait(wait::WaitArgs),
 
     /// Check whether one or more sandbox agents are reachable.
     Ping(ping::PingArgs),
@@ -115,7 +119,7 @@ pub async fn run(command: SandboxCommands, log_level: Option<LogLevel>) -> anyho
         SandboxCommands::Start(args) => start::run(args).await,
         SandboxCommands::Stop(args) => stop::run(args).await,
         SandboxCommands::Pause(args) => pause::run(args, false).await,
-        SandboxCommands::Branch(args) => branch::run(args).await,
+        SandboxCommands::Fork(args) => branch::run(args).await,
         SandboxCommands::Resume(args) => {
             pause::run(
                 pause::PauseArgs {
@@ -128,6 +132,7 @@ pub async fn run(command: SandboxCommands, log_level: Option<LogLevel>) -> anyho
             .await
         }
         SandboxCommands::Restart(args) => restart::run(args).await,
+        SandboxCommands::Wait(args) => wait::run(args).await,
         SandboxCommands::Ping(args) => ping::run(args).await,
         SandboxCommands::Touch(args) => touch::run(args).await,
         SandboxCommands::List(args) => list::run(args).await,

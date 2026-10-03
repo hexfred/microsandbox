@@ -15,7 +15,6 @@ mod timing;
 
 pub mod agent;
 pub mod backend;
-#[cfg(feature = "local")]
 pub mod config;
 #[allow(dead_code)]
 pub(crate) mod db;
@@ -30,6 +29,7 @@ pub mod sandbox;
 #[cfg(feature = "local")]
 pub mod setup;
 pub mod snapshot;
+pub mod storage;
 pub mod volume;
 
 pub use agent::{
@@ -41,10 +41,9 @@ pub use backend::{
     CloudCreateSandboxResponse, CloudErrorBody, CloudErrorDetails, CloudMessageResponse,
     CloudPaginated, CloudSandboxStatus, CloudSandboxStatusReason, CloudVolumeKind,
     CloudVolumeStatus, Profile, ProfileBackend, SandboxBackend, SandboxCloudState,
-    SandboxHandleCloudState, SandboxHandleInner, SandboxInner, SdkConfig, VolumeBackend,
-    VolumeCloudState, VolumeHandleCloudState, VolumeHandleInner, VolumeInner, default_backend,
-    default_backend_info, load_sdk_config, resolve_default_backend, set_default_backend,
-    swap_default_backend, with_backend,
+    SandboxHandleCloudState, SandboxHandleInner, SandboxInner, VolumeBackend, VolumeCloudState,
+    VolumeHandleCloudState, VolumeHandleInner, VolumeInner, default_backend, default_backend_info,
+    resolve_default_backend, set_default_backend, swap_default_backend, with_backend,
 };
 #[cfg(feature = "cloud")]
 pub use backend::{CloudBackend, CloudBackendBuilder, DEFAULT_CLOUD_API_URL};
@@ -95,8 +94,8 @@ pub use sandbox::{
     ExecOutput, ExternalMountRestorePolicy, ExternalMountWarning, MAX_HOSTNAME_BYTES,
     MAX_SANDBOX_NAME_BYTES, NetworkSpecPatch, Sandbox, SandboxConfig, SandboxConfigPatch,
     SandboxListBuilder, SandboxMetrics, SandboxPage, SandboxPingResult, SandboxPolicyPatch,
-    SandboxResourcesPatch, SandboxRuntimeOptionsPatch, SandboxTouchResult, VsockSpecPatch,
-    validate_sandbox_name,
+    SandboxResourcesPatch, SandboxRuntimeOptionsPatch, SandboxSpecPatch, SandboxTouchResult,
+    VsockSpecPatch, validate_sandbox_name,
 };
 pub use snapshot::{
     CheckpointSnapshotState, FileSnapshotState, HeadUpdate, HeadUpdateReason, LoadOpts, SaveOpts,
@@ -105,4 +104,5 @@ pub use snapshot::{
     SnapshotScope, SnapshotSpec, SnapshotState, SnapshotVerifyReport, UpperIntegrity,
     UpperVerifyStatus,
 };
+pub use storage::{Storage, StorageCategoryUsage, StorageItemUsage, StorageUsage};
 pub use volume::{Volume, VolumeConfig, VolumeHandle, VolumeKind, VolumeSpec};

@@ -1,6 +1,6 @@
 //! Sandbox modification planning.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use microsandbox_types::{
     EnvVar, RootDisk, RootfsSource, SecretSubstitution, SecretViolationAction,
@@ -12,7 +12,10 @@ use crate::db::entity::{sandbox as sandbox_entity, sandbox_label as sandbox_labe
 use crate::error::{Operation, UnsupportedReason};
 use crate::size::Mebibytes;
 use crate::{MicrosandboxError, MicrosandboxResult};
-use microsandbox_control_client::{SecretsResult, SetCpuTarget, SetMemoryTarget, UpdateSecrets};
+use microsandbox_control_client::{
+    CompactDisks, CreateCheckpoint, CreateDiskCheckpoint, GetCpuState, GetMemoryState,
+    GrowRootDisk, SecretsResult, SetCpuTarget, SetMemoryTarget, UpdateSecrets,
+};
 
 use super::{SandboxConfig, SandboxStatus};
 
@@ -45,6 +48,9 @@ const FUTURE_EXECS_ONLY: &str =
 const SECRETS_UNAVAILABLE_WITHOUT_NET: &str =
     "secret modification requires a build with the net feature";
 const SECRET_FIELD: &str = "secret";
+const TLS_FIELD: &str = "tls";
+const TLS_INTERCEPTION_REQUIRES_RESTART: &str =
+    "TLS-identity secrets require interception, which cannot be enabled on a running sandbox";
 const ROOT_DISK_FIELD: &str = "root_disk_size";
 const ENV_FIELD: &str = "env";
 const LABEL_FIELD: &str = "label";
@@ -106,7 +112,7 @@ struct LiveControl {
 
 /// A published runtime checkpoint and the independent outcome of source recovery.
 pub(crate) struct CheckpointCaptureOutcome {
-    pub(crate) checkpoint: microsandbox_runtime::control::CheckpointControlState,
+    pub(crate) checkpoint: microsandbox_protocol::control::CheckpointState,
     pub(crate) recovery_error: Option<String>,
 }
 
@@ -277,6 +283,12 @@ impl SandboxModificationBuilder {
     /// socket; the durable config records host-side source references for
     /// source-based specs and persists the value for value-based specs (the
     /// same at-rest property as create's `secret_env`).
+    ///
+    /// Configuring a secret that requires TLS identity on a sandbox with
+    /// interception off also turns interception on. That is planned as a
+    /// `tls` change and, like every other restart-backed change, needs
+    /// `restart` or `next_start` on a running sandbox. Existing secrets that
+    /// opt out of TLS identity continue to support live plain-HTTP updates.
     pub async fn apply(self) -> MicrosandboxResult<SandboxModificationPlan> {
         let handle = self
             .backend
@@ -303,23 +315,13 @@ impl SandboxModificationBuilder {
         );
 
         validate_apply_supported(&plan)?;
-        if let Some(local) = handle.local() {
-            // Refuse an unrepresentable persisted change before stopping a VM,
+        if handle.local().is_some() {
+            // Validate configuration serialization before stopping a VM,
             // growing a disk, or issuing any live control mutation.
             let mut prospective = config.clone();
             apply_patch_to_config(&mut prospective, &self.patch);
             apply_secret_patch_to_config(&mut prospective, &self.patch)?;
-            let backend = self
-                .backend
-                .as_local()
-                .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
-            crate::db::writing::encode_existing(
-                backend.db().await?.read(),
-                &prospective,
-                &local.config_json,
-                Some(backend.config()),
-            )
-            .await?;
+            serde_json::to_string(&prospective)?;
         }
         let restart_required = plan_requires_restart(&plan) && running_status(status);
         if restart_required {
@@ -413,13 +415,12 @@ impl SandboxModificationBuilder {
             && let Some(target_mib) = root_disk_grow_target(&plan, &self.patch, &config)
         {
             let size_bytes = u64::from(target_mib) * 1024 * 1024;
-            let request = serde_json::to_string(
-                &microsandbox_runtime::control::ControlRequest::RootDiskGrow { size_bytes },
-            )? + "\n";
-            let response = control_request(&self.name, request).await?;
-            let observed = response.root_disk.ok_or_else(|| {
-                crate::MicrosandboxError::Runtime("root growth reply missing capacity".into())
-            })?;
+            let observed = control_session(&session)?
+                .request(&GrowRootDisk(
+                    microsandbox_protocol::control::RootDiskGrow { size_bytes },
+                ))
+                .await
+                .map_err(crate::MicrosandboxError::ControlClient)?;
             if observed.filesystem_bytes != size_bytes || observed.device_bytes < size_bytes {
                 return Err(crate::MicrosandboxError::Runtime(
                     "root growth did not confirm usable capacity".into(),
@@ -518,10 +519,16 @@ impl SecretPatchBuilder {
         self
     }
 
-    /// Add a host allowed to receive the placeholder unchanged.
-    pub fn allow_passthrough_for(mut self, host: impl Into<String>) -> Self {
+    /// Add a host allowed to receive the unchanged placeholder where substitution does not apply.
+    pub fn allow_placeholder_for(mut self, host: impl Into<String>) -> Self {
         self.spec.passthrough_hosts.push(host.into());
         self
+    }
+
+    /// Deprecated alias for [`allow_placeholder_for`](Self::allow_placeholder_for).
+    #[deprecated(note = "use allow_placeholder_for instead")]
+    pub fn allow_passthrough_for(self, host: impl Into<String>) -> Self {
+        self.allow_placeholder_for(host)
     }
 
     /// Set the per-secret blocking action.
@@ -716,29 +723,6 @@ async fn grow_root_disk_now(
     super::upper::grow_upper_to_mib(sandbox_dir.join("upper.ext4"), target_mib).await
 }
 
-/// Path of the sandbox's host-side runtime control socket.
-#[cfg(windows)]
-fn control_socket_path(name: &str) -> MicrosandboxResult<std::path::PathBuf> {
-    Ok(microsandbox_runtime::control::control_socket_path_for(
-        &crate::runtime::agent_socket_path(name)?,
-    ))
-}
-
-#[cfg(unix)]
-fn control_socket_path_candidates(name: &str) -> Vec<std::path::PathBuf> {
-    control_socket_paths(crate::runtime::sandbox_agent_socket_path_candidates(name))
-}
-
-#[cfg(unix)]
-fn control_socket_paths(
-    agent_candidates: impl IntoIterator<Item = std::path::PathBuf>,
-) -> Vec<std::path::PathBuf> {
-    agent_candidates
-        .into_iter()
-        .map(|path| microsandbox_runtime::control::control_socket_path_for(&path))
-        .collect()
-}
-
 /// Discover which live-control operations the running sandbox serves.
 async fn live_control(
     backend: &Arc<dyn Backend>,
@@ -781,51 +765,21 @@ fn control_session(session: &Option<ControlSession>) -> MicrosandboxResult<&Cont
     })
 }
 
-/// Open the runtime control pipe within its connection budget. Restore callers
-/// additionally bound this wait by their remaining startup deadline.
-#[cfg(windows)]
-async fn connect_control_pipe(
-    path: &std::path::Path,
-) -> MicrosandboxResult<tokio::net::windows::named_pipe::NamedPipeClient> {
-    super::control_pipe::connect(path).await.map_err(|error| {
-        crate::MicrosandboxError::Runtime(format!(
-            "failed to reach the runtime control pipe at {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-/// Send one control request line and parse the reply.
-pub(super) async fn control_request(
-    name: &str,
-    request: String,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    let response = control_request_raw(name, request).await?;
-    if !response.ok {
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "live update refused: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )));
-    }
-    Ok(response)
-}
-
-/// Use the handle's local backend, never an ambient backend with a matching sandbox name.
-pub(super) async fn control_request_for(
+/// Retain the protocol session only when it matches an earlier identity-bearing selection.
+pub(super) async fn control_session_for_run(
     local: &crate::backend::LocalBackend,
     name: &str,
-    request: String,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    let response = control_request_raw_for(local, name, request).await?;
-    if !response.ok {
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "runtime control refused: {}",
-            response.error.unwrap_or_else(|| "unknown error".into())
+    run: super::identity::SandboxRunIdentity,
+) -> MicrosandboxResult<ControlSession> {
+    let session = local.control_session(name).await?.ok_or_else(|| {
+        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
+    })?;
+    if !session.matches_run(run) {
+        return Err(MicrosandboxError::ControlClient(Arc::new(
+            microsandbox_control_client::ControlClientError::RuntimeChanged,
         )));
     }
-    Ok(response)
+    Ok(session)
 }
 
 /// Project restored live targets into configuration after construction used original geometry.
@@ -834,18 +788,24 @@ pub(crate) async fn restore_requested_resources(
     config: &mut super::SandboxConfig,
 ) -> MicrosandboxResult<()> {
     let resources = &config.spec.resources;
+    let session =
+        if resources.max_cpus > resources.cpus || resources.max_memory_mib > resources.memory_mib {
+            // The restored sandbox is still `Starting` here: readiness is published after this.
+            local
+                .control_session_while_starting(&config.spec.name)
+                .await?
+        } else {
+            None
+        };
     let mut cpus = resources.cpus;
     let mut memory_mib = resources.memory_mib;
     // libkrun creates the CPU controller only when capacity exceeds boot CPUs.
     // A fixed multi-CPU VM has no controller; its captured boot count is already final.
     if resources.max_cpus > resources.cpus {
-        let state =
-            control_request_for(local, &config.spec.name, "{\"op\":\"cpu_state\"}\n".into())
-                .await?
-                .cpu
-                .ok_or_else(|| {
-                    crate::MicrosandboxError::Runtime("restored runtime omitted CPU state".into())
-                })?;
+        let state = control_session(&session)?
+            .request(&GetCpuState)
+            .await
+            .map_err(MicrosandboxError::ControlClient)?;
         if state.possible != u32::from(resources.max_cpus)
             || state.requested_online == 0
             || state.requested_online > state.possible
@@ -857,16 +817,10 @@ pub(crate) async fn restore_requested_resources(
         cpus = state.requested_online as u8;
     }
     if resources.max_memory_mib > resources.memory_mib {
-        let state = control_request_for(
-            local,
-            &config.spec.name,
-            "{\"op\":\"memory_state\"}\n".into(),
-        )
-        .await?
-        .memory
-        .ok_or_else(|| {
-            crate::MicrosandboxError::Runtime("restored runtime omitted memory state".into())
-        })?;
+        let state = control_session(&session)?
+            .request(&GetMemoryState)
+            .await
+            .map_err(MicrosandboxError::ControlClient)?;
         if state.boot_mib != u64::from(resources.memory_mib)
             || state.max_mib != u64::from(resources.max_memory_mib)
             || state.target_mib < state.boot_mib
@@ -886,6 +840,7 @@ pub(crate) async fn restore_requested_resources(
 }
 
 /// Bind the command to the selected process before sending any bytes on a reusable endpoint.
+#[cfg(all(test, unix))]
 pub(super) async fn control_request_for_run(
     local: &crate::backend::LocalBackend,
     name: &str,
@@ -896,6 +851,7 @@ pub(super) async fn control_request_for_run(
 }
 
 /// Optional descriptor travels with the first request byte on the already authenticated socket.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(super) async fn control_request_for_run_with_memory(
     local: &crate::backend::LocalBackend,
     name: &str,
@@ -908,14 +864,6 @@ pub(super) async fn control_request_for_run_with_memory(
         .map(|path| microsandbox_runtime::control::control_socket_path_for(&path));
     #[cfg(unix)]
     let stream = connect_control_socket(candidates).await?;
-    #[cfg(windows)]
-    let stream = connect_control_pipe(
-        &candidates
-            .into_iter()
-            .next()
-            .ok_or_else(|| MicrosandboxError::Runtime("no backend control endpoint".into()))?,
-    )
-    .await?;
     let peer_pid = control_peer_pid(&stream)?;
     if peer_pid != run.pid {
         return Err(MicrosandboxError::Runtime(format!(
@@ -962,7 +910,7 @@ fn control_peer_pid(stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn control_peer_pid(stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
     use std::os::fd::AsRawFd;
     let mut pid: libc::pid_t = 0;
@@ -989,7 +937,7 @@ fn control_peer_pid(stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
     Ok(pid)
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(test, unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn control_peer_pid(_stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -997,65 +945,7 @@ fn control_peer_pid(_stream: &tokio::net::UnixStream) -> std::io::Result<i32> {
     ))
 }
 
-#[cfg(windows)]
-fn control_peer_pid(
-    stream: &tokio::net::windows::named_pipe::NamedPipeClient,
-) -> std::io::Result<i32> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId};
-    let mut pid = 0u32;
-    let result = unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle() as HANDLE, &mut pid) };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    i32::try_from(pid)
-        .map_err(|_| std::io::Error::other("control endpoint PID exceeds supported range"))
-}
-
-async fn control_request_raw_for(
-    local: &crate::backend::LocalBackend,
-    name: &str,
-    request: String,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    let candidates = crate::runtime::sandbox_agent_socket_path_candidates_for(local, name)
-        .into_iter()
-        .map(|path| microsandbox_runtime::control::control_socket_path_for(&path));
-    #[cfg(unix)]
-    let stream = connect_control_socket(candidates).await?;
-    #[cfg(windows)]
-    let stream =
-        connect_control_pipe(&candidates.into_iter().next().ok_or_else(|| {
-            crate::MicrosandboxError::Runtime("no backend control endpoint".into())
-        })?)
-        .await?;
-    control_request_over_stream(stream, &request).await
-}
-
-async fn control_request_raw(
-    name: &str,
-    request: String,
-) -> MicrosandboxResult<microsandbox_runtime::control::ControlResponse> {
-    #[cfg(unix)]
-    {
-        let stream = connect_control_socket(control_socket_path_candidates(name))
-            .await
-            .map_err(|error| {
-                crate::MicrosandboxError::Runtime(format!(
-                    "failed to reach a runtime control socket for sandbox {name:?}: {error}"
-                ))
-            })?;
-        return control_request_over_stream(stream, &request).await;
-    }
-
-    #[cfg(windows)]
-    {
-        let path = control_socket_path(name)?;
-        let stream = connect_control_pipe(&path).await?;
-        control_request_over_stream(stream, &request).await
-    }
-}
-
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 async fn connect_control_socket(
     candidates: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> std::io::Result<tokio::net::UnixStream> {
@@ -1079,6 +969,7 @@ async fn connect_control_socket(
 }
 
 /// Send and receive one control exchange over an already-connected transport.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 async fn control_request_over_stream<S>(
     mut stream: S,
     request: &str,
@@ -1113,28 +1004,23 @@ pub(crate) async fn control_disk_compact(
 ) -> MicrosandboxResult<super::DiskCompactionResult> {
     // Discovery and mutation must use the same retained backend as the selected sandbox.
     // An ambient backend may contain a different sandbox with this exact name.
-    let capabilities = control_request_for(local, name, "{\"op\":\"capabilities\"}\n".into())
-        .await?
-        .capabilities
-        .ok_or_else(|| {
-            crate::MicrosandboxError::Runtime("control response missing capabilities".into())
-        })?;
+    let session = local.control_session(name).await?.ok_or_else(|| {
+        crate::MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
+    })?;
+    let capabilities = session.capabilities();
     if !capabilities.disk_compact_owned {
         return Err(crate::MicrosandboxError::Runtime(
             "this running sandbox does not support disk compaction; restart with the updated runtime".into(),
         ));
     }
-    let request = microsandbox_runtime::control::ControlRequest::DiskCompact {
-        target,
-        layers,
-        dry_run,
-    };
-    let mut line = serde_json::to_string(&request)?;
-    line.push('\n');
-    let response = control_request_for(local, name, line).await?;
-    response.compaction.ok_or_else(|| {
-        crate::MicrosandboxError::Runtime("control response omitted compaction result".into())
-    })
+    session
+        .request(&CompactDisks(microsandbox_protocol::control::DiskCompact {
+            target,
+            layers: layers.map(|value| value as u64),
+            dry_run,
+        }))
+        .await
+        .map_err(crate::MicrosandboxError::ControlClient)
 }
 
 /// Capture one full checkpoint through the running sandbox's existing control endpoint.
@@ -1148,12 +1034,11 @@ pub(crate) async fn control_checkpoint_create(
     record_integrity: bool,
     guest_flush: microsandbox_types::GuestFlush,
 ) -> MicrosandboxResult<CheckpointCaptureOutcome> {
-    let capabilities =
-        control_request_for(local, name, "{\"op\":\"capabilities\"}\n".into()).await?;
-    if !capabilities
-        .capabilities
-        .is_some_and(|capabilities| capabilities.checkpoint_create)
-    {
+    let session = local.control_session(name).await?.ok_or_else(|| {
+        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
+    })?;
+    let capabilities = session.capabilities();
+    if !capabilities.checkpoint_create {
         return Err(MicrosandboxError::unsupported(
             Operation::SnapshotOps,
             UnsupportedReason::NotAvailable(
@@ -1161,49 +1046,35 @@ pub(crate) async fn control_checkpoint_create(
             ),
         ));
     }
-    let request = microsandbox_runtime::control::ControlRequest::CheckpointCreate {
-        guest_flush: capture_flush_policy(capabilities.capabilities, guest_flush, false)?,
+    let request = microsandbox_protocol::control::CheckpointCreate {
+        guest_flush: capture_flush_policy(Some(capabilities), guest_flush, false)?,
         record_integrity,
         checkpoint_id,
-        intent: microsandbox_runtime::control::CheckpointCaptureIntent::FullSnapshot,
+        intent: microsandbox_protocol::control::CheckpointCaptureIntent::FullSnapshot,
     };
-    if !capabilities
-        .capabilities
-        .is_some_and(|c| c.optional_disk_integrity)
-    {
+    if !capabilities.optional_disk_integrity {
         return Err(MicrosandboxError::Runtime(
             "source runtime lacks optional disk integrity; restart with the matching runtime"
                 .into(),
         ));
     }
-    let response = control_request_raw_for(
-        local,
-        name,
-        format!("{}\n", serde_json::to_string(&request)?),
-    )
-    .await?;
+    let response = session
+        .request(&CreateCheckpoint(request))
+        .await
+        .map_err(crate::MicrosandboxError::ControlClient)?;
     checkpoint_response(response)
 }
 
 fn checkpoint_response(
-    response: microsandbox_runtime::control::ControlResponse,
+    response: microsandbox_protocol::control::CheckpointResult,
 ) -> MicrosandboxResult<CheckpointCaptureOutcome> {
-    if let Some(checkpoint) = response.checkpoint {
-        return Ok(CheckpointCaptureOutcome {
-            checkpoint,
-            recovery_error: (!response.ok).then(|| {
-                response
-                    .error
-                    .unwrap_or_else(|| "source recovery failed without a runtime diagnostic".into())
-            }),
-        });
-    }
-    Err(crate::MicrosandboxError::Runtime(format!(
-        "full checkpoint refused: {}",
-        response
-            .error
-            .unwrap_or_else(|| "control response omitted checkpoint state".into())
-    )))
+    let checkpoint = response.checkpoint.ok_or_else(|| {
+        MicrosandboxError::Runtime("control response omitted checkpoint state".into())
+    })?;
+    Ok(CheckpointCaptureOutcome {
+        checkpoint,
+        recovery_error: response.recovery_error,
+    })
 }
 
 /// Request disk-only capture without falling back to full-state capture or a stopped copy.
@@ -1213,31 +1084,34 @@ pub(crate) async fn control_disk_checkpoint_create(
     checkpoint_id: String,
     guest_flush: microsandbox_types::GuestFlush,
 ) -> MicrosandboxResult<microsandbox_runtime::control::DiskCheckpointControlState> {
-    let capabilities =
-        control_request_for(local, name, "{\"op\":\"capabilities\"}\n".into()).await?;
-    if !capabilities
-        .capabilities
-        .is_some_and(|c| c.disk_checkpoint_create)
-    {
+    let session = local.control_session(name).await?.ok_or_else(|| {
+        MicrosandboxError::Runtime("runtime control endpoint is unavailable".into())
+    })?;
+    let capabilities = session.capabilities();
+    if !capabilities.disk_checkpoint_create {
         return Err(MicrosandboxError::unsupported(Operation::SnapshotOps,
             UnsupportedReason::NotAvailable("this runtime does not support live disk-only snapshots; recreate the sandbox with the updated runtime".into())));
     }
-    let request = microsandbox_runtime::control::ControlRequest::DiskCheckpointCreate {
+    let request = microsandbox_protocol::control::DiskCheckpointCreate {
         checkpoint_id,
-        guest_flush: capture_flush_policy(capabilities.capabilities, guest_flush, true)?,
+        guest_flush: capture_flush_policy(Some(capabilities), guest_flush, true)?,
     };
-    let mut line = serde_json::to_string(&request)?;
-    line.push('\n');
-    let response = control_request_for(local, name, line).await?;
-    response.disk_checkpoint.ok_or_else(|| {
-        MicrosandboxError::Runtime("runtime omitted the disk-only capture result".into())
+    let response = session
+        .request(&CreateDiskCheckpoint(request))
+        .await
+        .map_err(crate::MicrosandboxError::ControlClient)?;
+    Ok(microsandbox_runtime::control::DiskCheckpointControlState {
+        checkpoint_id: response.checkpoint_id,
+        path: response.path,
+        disk: response.disk,
+        owned_volumes: response.owned_volumes,
     })
 }
 
 /// Never let an older runtime silently discard an explicit policy. Full Auto is the
 /// released behavior and can retain the old request shape; disk Auto is a new guarantee.
 pub(crate) fn capture_flush_policy(
-    capabilities: Option<microsandbox_runtime::control::ControlCapabilities>,
+    capabilities: Option<microsandbox_protocol::control::RuntimeCapabilities>,
     policy: microsandbox_types::GuestFlush,
     disk_only: bool,
 ) -> MicrosandboxResult<Option<microsandbox_types::GuestFlush>> {
@@ -1259,10 +1133,25 @@ async fn control_secrets_update(
     session: &ControlSession,
     changes: Vec<microsandbox_runtime::control::SecretLiveChange>,
 ) -> MicrosandboxResult<()> {
+    let changes = changes
+        .into_iter()
+        .map(|change| match change {
+            microsandbox_runtime::control::SecretLiveChange::Rotate { name, value } => {
+                microsandbox_protocol::control::SecretChange::Rotate {
+                    name,
+                    value: microsandbox_protocol::control::SecretValue(value.0.clone()),
+                }
+            }
+            microsandbox_runtime::control::SecretLiveChange::Remove { name } => {
+                microsandbox_protocol::control::SecretChange::Remove { name }
+            }
+            microsandbox_runtime::control::SecretLiveChange::SetAllowedHosts { name, hosts } => {
+                microsandbox_protocol::control::SecretChange::SetAllowedHosts { name, hosts }
+            }
+        })
+        .collect();
     match session
-        .request(&UpdateSecrets::new(serde_json::from_value(
-            serde_json::to_value(changes)?,
-        )?))
+        .request(&UpdateSecrets::new(changes))
         .await
         .map_err(crate::MicrosandboxError::ControlClient)?
     {
@@ -1434,6 +1323,12 @@ fn apply_secret_patch_to_config(
         .secrets
         .secrets
         .retain(|entry| !patch.secrets_remove.contains(&entry.env_var));
+    // TLS-identity secrets require interception; deliberate plain-HTTP
+    // secrets do not. This is one-way because TLS may have been enabled for
+    // independent reasons.
+    if !network.tls.enabled && network.secrets.has_tls_identity_secrets() {
+        network.tls.enabled = true;
+    }
     // Enforce env-var and placeholder shape rules before anything persists;
     // validation errors carry entry indexes and sizes, never values.
     network.secrets.validate().map_err(|err| {
@@ -1692,13 +1587,7 @@ async fn persist_config(
 
     let labels = config.spec.labels.clone();
     let write_db = local_backend.db().await?.write();
-    let config_json = crate::db::writing::encode_existing(
-        write_db,
-        config,
-        &local.config_json,
-        Some(local_backend.config()),
-    )
-    .await?;
+    let config_json = serde_json::to_string(config)?;
 
     write_db
         .transaction(|txn| {
@@ -1751,7 +1640,6 @@ async fn persist_active_config(
             local_backend.db().await?.write(),
             expected.as_deref(),
             active,
-            Some(local_backend.config()),
         )
         .await?;
     *expected = Some(json);
@@ -2140,6 +2028,23 @@ fn push_secret_changes(
                 .unwrap_or_default(),
             reason,
         }));
+    }
+
+    // Surface the implied TLS enable as its own change rather than flipping
+    // a config field invisibly: it keeps the dry-run honest and routes the
+    // patch through the restart path, the only way interception can start.
+    // Check the post-patch secret set so removals, TLS-identity opt-outs, and
+    // mixed secret sets cannot make the plan disagree with persisted state.
+    if secret_patch_requires_tls_enable(config, patch) {
+        changes.push(spec_change(
+            TLS_FIELD,
+            ChangeKind::Updated,
+            Some("interception disabled".to_string()),
+            Some("interception enabled".to_string()),
+            status,
+            policy,
+            TLS_INTERCEPTION_REQUIRES_RESTART,
+        ));
     }
 }
 
@@ -2721,6 +2626,57 @@ fn existing_secret_from_network_config(
     None
 }
 
+/// Whether the post-patch secret set requires enabling TLS interception.
+///
+/// Existing entries retain their `require_tls_identity` setting unless the
+/// patch overrides it; new entries use the TLS-identity default unless they
+/// explicitly opt out. Removals are evaluated last, just like persistence,
+/// without copying or resolving any secret material.
+/// Without `net`, secret changes are already unsupported and this returns
+/// `false` rather than adding a second planned change.
+fn secret_patch_requires_tls_enable(
+    config: &SandboxConfig,
+    patch: &SandboxModificationPatch,
+) -> bool {
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = (config, patch);
+        false
+    }
+
+    #[cfg(feature = "net")]
+    {
+        if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
+            return false;
+        }
+        let Ok(network) = config.local_network_config() else {
+            return false;
+        };
+        if network.tls.enabled {
+            return false;
+        }
+
+        let mut tls_identity_by_name: HashMap<&str, bool> = network
+            .secrets
+            .secrets
+            .iter()
+            .map(|entry| (entry.env_var.as_str(), entry.require_tls_identity))
+            .collect();
+        for spec in &patch.secrets {
+            let required = spec
+                .require_tls_identity
+                .or_else(|| tls_identity_by_name.get(spec.name.as_str()).copied())
+                .unwrap_or(true);
+            tls_identity_by_name.insert(spec.name.as_str(), required);
+        }
+        for name in &patch.secrets_remove {
+            tls_identity_by_name.remove(name.as_str());
+        }
+
+        tls_identity_by_name.values().any(|required| *required)
+    }
+}
+
 #[cfg(feature = "net")]
 fn format_host_pattern(host: microsandbox_network::secrets::config::HostPattern) -> String {
     match host {
@@ -2825,8 +2781,8 @@ mod tests {
     #[test]
     fn guest_flush_capability_never_silently_weakens_capture() {
         use microsandbox_types::GuestFlush::{Auto, Required, Skip};
-        let old = microsandbox_runtime::control::ControlCapabilities::default();
-        let new = microsandbox_runtime::control::ControlCapabilities {
+        let old = microsandbox_protocol::control::RuntimeCapabilities::default();
+        let new = microsandbox_protocol::control::RuntimeCapabilities {
             guest_flush_policy: true,
             ..old
         };
@@ -2855,8 +2811,7 @@ mod tests {
     #[tokio::test]
     async fn restored_fixed_cpu_counts_do_not_require_a_hotplug_controller() {
         let home = tempfile::tempdir().unwrap();
-        let local = LocalBackend::builder()
-            .home(home.path())
+        let local = crate::test_support::local_backend_builder(home.path())
             .build()
             .await
             .unwrap();
@@ -2873,23 +2828,99 @@ mod tests {
         }
     }
 
+    /// A checkpoint restore reads the restored CPU target before the creator publishes the
+    /// sandbox as `Running`; ordinary control sessions still refuse a sandbox that is `Starting`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_cpu_target_is_read_while_the_sandbox_is_still_starting() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let local = crate::test_support::local_backend_builder(home.path())
+            .build()
+            .await
+            .unwrap();
+        seed_control_run_with_status(&local, "api", SandboxStatus::Starting).await;
+        let agent =
+            crate::runtime::sandbox_agent_socket_path_candidates_for(&local, "api").remove(0);
+        let path = microsandbox_runtime::control::control_socket_path_for(&agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        // An ordinary session does not own a sandbox that has not been published yet.
+        assert!(matches!(
+            local.control_session("api").await,
+            Err(crate::MicrosandboxError::ControlClient(error))
+                if matches!(&*error, microsandbox_control_client::ControlClientError::RuntimeChanged)
+        ));
+        let server = tokio::spawn(async move {
+            for (op, reply) in [
+                (
+                    "capabilities",
+                    "{\"ok\":true,\"capabilities\":{\"cpu_resize\":true,\"memory_resize\":true,\"secrets_update\":false}}",
+                ),
+                (
+                    "cpu_state",
+                    "{\"ok\":true,\"cpu\":{\"possible\":4,\"requested_online\":2,\"actual_online\":2,\"enforced\":2}}",
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["op"],
+                    op
+                );
+                stream
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut config = config(1, 256);
+        config.spec.resources.max_cpus = 4;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            restore_requested_resources(&local, &mut config),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.spec.resources.cpus, 2);
+        server.await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn restored_hotplug_cpu_state_still_rejects_invalid_targets() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let home = tempfile::tempdir_in("/tmp").unwrap();
-        let local = LocalBackend::builder()
-            .home(home.path())
+        let local = crate::test_support::local_backend_builder(home.path())
             .build()
             .await
             .unwrap();
+        seed_control_run(&local, "api").await;
         let agent =
             crate::runtime::sandbox_agent_socket_path_candidates_for(&local, "api").remove(0);
         let path = microsandbox_runtime::control::control_socket_path_for(&agent);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(path).unwrap();
         let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["op"],
+                "capabilities"
+            );
+            stream
+                .get_mut()
+                .write_all(b"{\"ok\":true,\"capabilities\":{\"cpu_resize\":true,\"memory_resize\":true,\"secrets_update\":false}}\n")
+                .await
+                .unwrap();
             for (possible, requested) in [(3, 2), (4, 0), (4, 5)] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(stream);
@@ -2931,17 +2962,30 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let home = tempfile::tempdir_in("/tmp").unwrap();
-        let local = LocalBackend::builder()
-            .home(home.path())
+        let local = crate::test_support::local_backend_builder(home.path())
             .build()
             .await
             .unwrap();
+        seed_control_run(&local, "api").await;
         let agent =
             crate::runtime::sandbox_agent_socket_path_candidates_for(&local, "api").remove(0);
         let path = microsandbox_runtime::control::control_socket_path_for(&agent);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(path).unwrap();
         let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["op"],
+                "capabilities"
+            );
+            stream
+                .get_mut()
+                .write_all(b"{\"ok\":true,\"capabilities\":{\"cpu_resize\":true,\"memory_resize\":true,\"secrets_update\":false}}\n")
+                .await
+                .unwrap();
             for (op, response) in [
                 (
                     "cpu_state",
@@ -2991,16 +3035,16 @@ mod tests {
 
         let first_home = tempfile::tempdir_in("/tmp").unwrap();
         let second_home = tempfile::tempdir_in("/tmp").unwrap();
-        let first = LocalBackend::builder()
-            .home(first_home.path())
+        let first = crate::test_support::local_backend_builder(first_home.path())
             .build()
             .await
             .unwrap();
-        let second = LocalBackend::builder()
-            .home(second_home.path())
+        let second = crate::test_support::local_backend_builder(second_home.path())
             .build()
             .await
             .unwrap();
+        seed_control_run(&first, "worker").await;
+        seed_control_run(&second, "worker").await;
         let mut servers = Vec::new();
         for (local, marker, target) in [
             (&first, 1, DiskCompactionTarget::All),
@@ -3074,16 +3118,16 @@ mod tests {
 
         let first_home = tempfile::tempdir_in("/tmp").unwrap();
         let second_home = tempfile::tempdir_in("/tmp").unwrap();
-        let first = LocalBackend::builder()
-            .home(first_home.path())
+        let first = crate::test_support::local_backend_builder(first_home.path())
             .build()
             .await
             .unwrap();
-        let second = LocalBackend::builder()
-            .home(second_home.path())
+        let second = crate::test_support::local_backend_builder(second_home.path())
             .build()
             .await
             .unwrap();
+        seed_control_run(&first, "worker").await;
+        seed_control_run(&second, "worker").await;
         let mut servers = Vec::new();
         for (local, label, resume_ok) in [(&first, "first", true), (&second, "second", false)] {
             let agent =
@@ -3153,8 +3197,7 @@ mod tests {
     async fn size_setters_accept_bare_mib_and_typed_sizes() {
         let temp = tempdir().unwrap();
         let backend: Arc<dyn Backend> = Arc::new(
-            LocalBackend::builder()
-                .home(temp.path())
+            crate::test_support::local_backend_builder(temp.path())
                 .build()
                 .await
                 .unwrap(),
@@ -3174,10 +3217,9 @@ mod tests {
         }
     }
 
-    fn checkpoint_reply(ok: bool) -> microsandbox_runtime::control::ControlResponse {
-        microsandbox_runtime::control::ControlResponse {
-            ok,
-            checkpoint: Some(microsandbox_runtime::control::CheckpointControlState {
+    fn checkpoint_reply(ok: bool) -> microsandbox_protocol::control::CheckpointResult {
+        microsandbox_protocol::control::CheckpointResult {
+            checkpoint: Some(microsandbox_protocol::control::CheckpointState {
                 checkpoint_id: "checkpoint_test".into(),
                 checkpoint_root: format!("sha256:{}", "a".repeat(64)),
                 path: "/runtime/checkpoint_test".into(),
@@ -3185,7 +3227,8 @@ mod tests {
                 memory_logical_bytes: 4096,
                 memory_emitted_bytes: 4096,
             }),
-            ..Default::default()
+            recovery_error: (!ok)
+                .then(|| "source recovery failed without a runtime diagnostic".into()),
         }
     }
 
@@ -3193,7 +3236,7 @@ mod tests {
     fn checkpoint_reply_preserves_publication_and_failed_source_recovery() {
         for detail in ["resume failed", "thaw timed out; re-pause failed"] {
             let mut response = checkpoint_reply(false);
-            response.error = Some(detail.into());
+            response.recovery_error = Some(detail.into());
             let outcome = checkpoint_response(response).unwrap();
             assert_eq!(outcome.checkpoint.checkpoint_id, "checkpoint_test");
             assert_eq!(outcome.recovery_error.as_deref(), Some(detail));
@@ -3235,11 +3278,43 @@ mod tests {
         config
     }
 
+    async fn seed_control_run(local: &LocalBackend, name: &str) {
+        seed_control_run_with_status(local, name, SandboxStatus::Running).await;
+    }
+
+    async fn seed_control_run_with_status(local: &LocalBackend, name: &str, status: SandboxStatus) {
+        use crate::db::entity::{run, sandbox};
+
+        let db = local.db().await.unwrap();
+        let sandbox_id = sandbox::Entity::insert(sandbox::ActiveModel {
+            name: Set(name.into()),
+            config: Set("{}".into()),
+            status: Set(status),
+            ephemeral: Set(false),
+            ..Default::default()
+        })
+        .exec(db.write())
+        .await
+        .unwrap()
+        .last_insert_id;
+        run::Entity::insert(run::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(std::process::id() as i32)),
+            status: Set(run::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(db.write())
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn persist_config_replaces_label_projection() {
         let temp = tempdir().unwrap();
         let backend: Arc<dyn Backend> = Arc::new(
             LocalBackend::builder()
+                .config_path(temp.path().join("config.json"))
+                .managed_config_path(temp.path().join("managed.json"))
                 .home(temp.path())
                 .build()
                 .await
@@ -4441,6 +4516,29 @@ mod tests {
             violation_action: None,
             require_tls_identity: true,
         });
+        // Mirror the top-level sandbox builder's create-time policy.
+        crate::sandbox::config::ensure_tls_for_secrets(&mut network);
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    /// The pre-fix shape this bug used to persist: a secret with TLS off.
+    #[cfg(feature = "net")]
+    fn config_with_secret_and_tls_disabled(name: &str, value: &str) -> SandboxConfig {
+        let mut config = config_with_secret(name, value);
+        let mut network = config.local_network_config().unwrap();
+        network.tls.enabled = false;
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    /// A deliberate plain-HTTP secret configuration: substitution is allowed
+    /// without TLS identity, so interception stays off.
+    #[cfg(feature = "net")]
+    fn config_with_plain_http_secret_and_tls_disabled(name: &str, value: &str) -> SandboxConfig {
+        let mut config = config_with_secret_and_tls_disabled(name, value);
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets[0].require_tls_identity = false;
         config.set_local_network_config(network).unwrap();
         config
     }
@@ -4475,6 +4573,15 @@ mod tests {
             secrets: specs,
             ..SandboxModificationPatch::default()
         }
+    }
+
+    /// The `tls` change a secret patch emits when it must turn interception on.
+    #[cfg(feature = "net")]
+    fn tls_plan_change(plan: &SandboxModificationPlan) -> Option<&ConfigPlannedChange> {
+        plan.changes.iter().find_map(|change| match change {
+            PlannedChange::Config(change) if change.field == TLS_FIELD => Some(change),
+            _ => None,
+        })
     }
 
     #[cfg(feature = "net")]
@@ -4862,6 +4969,350 @@ mod tests {
         assert!(conflicts[0].message.contains("needs a name"));
     }
 
+    /// Regression for #1422: the first secret left `tls.enabled` false, so the
+    /// placeholder reached the upstream unsubstituted.
+    #[cfg(feature = "net")]
+    #[test]
+    fn adding_first_secret_enables_tls_in_durable_config() {
+        let mut config = config(2, 1024);
+        assert!(!config.local_network_config().unwrap().tls.enabled);
+
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &["api.example.com"])]);
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert!(network.tls.enabled);
+    }
+
+    /// Interception is restart-backed, so the first secret must show up in the
+    /// plan and drive the restart rather than flip silently under a running VM.
+    #[cfg(feature = "net")]
+    #[test]
+    fn first_secret_plans_tls_change_and_forces_restart() {
+        let config = config(2, 1024);
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &["api.example.com"])]);
+
+        // Stopped: lands on the next start.
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Stopped,
+            &config,
+            None,
+            LiveControl::default(),
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+        let tls = tls_plan_change(&plan).expect("expected a tls change");
+        assert_eq!(tls.change, ChangeKind::Updated);
+        assert_eq!(tls.disposition, ModificationDisposition::NextStart);
+        assert!(validate_apply_supported(&plan).is_ok());
+
+        // Running under the default policy: an explicit error.
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        assert!(validate_apply_supported(&plan).is_err());
+
+        // Restart opted in: the restart rebuilds active from the durable config.
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch,
+            ModificationPolicy::Restart,
+        );
+        assert!(validate_apply_supported(&plan).is_ok());
+        assert!(plan_requires_restart(&plan));
+    }
+
+    /// Rotating a secret on a legacy TLS-off config classifies as live, and
+    /// mirroring it would claim TLS the running proxy does not have.
+    #[cfg(feature = "net")]
+    #[test]
+    fn live_secret_change_on_tls_disabled_config_requires_restart() {
+        let config = config_with_secret_and_tls_disabled("API_KEY", SECRET_SENTINEL);
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &[])]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch,
+            ModificationPolicy::NoRestart,
+        );
+
+        // The rotate itself is live-applicable, so tls is the only blocker.
+        let secret_dispositions: Vec<_> = plan
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                PlannedChange::Secret(change) => Some(change.disposition),
+                PlannedChange::Config(_) => None,
+            })
+            .collect();
+        assert_eq!(secret_dispositions, vec![ModificationDisposition::Live]);
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        let err = validate_apply_supported(&plan).unwrap_err().to_string();
+        assert_eq!(err, "cannot apply modification: tls requires restart");
+    }
+
+    /// Plain-HTTP substitution is an intentional TLS-off configuration, so a
+    /// live rotation must not enable interception or force a restart.
+    #[cfg(feature = "net")]
+    #[test]
+    fn live_plain_http_secret_rotation_does_not_enable_tls() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("API_KEY", SECRET_SENTINEL);
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &[])]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+        assert_eq!(
+            secret_plan_dispositions(&plan),
+            vec![ModificationDisposition::Live]
+        );
+        assert!(validate_apply_supported(&plan).is_ok());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(!network.tls.enabled);
+        assert!(!network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// Enabling TLS identity on an existing plain-HTTP secret must plan the
+    /// interception restart that persistence will require.
+    #[cfg(feature = "net")]
+    #[test]
+    fn enabling_tls_identity_on_existing_secret_plans_tls_restart() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("API_KEY", SECRET_SENTINEL);
+        let mut spec = source_spec("API_KEY", &[]);
+        spec.require_tls_identity = Some(true);
+        let patch = patch_with_specs(vec![spec]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        assert!(validate_apply_supported(&plan).is_err());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(network.tls.enabled);
+        assert!(network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// A new secret can explicitly opt out of TLS identity, so persistence
+    /// and planning must both leave interception disabled.
+    #[cfg(feature = "net")]
+    #[test]
+    fn adding_plain_http_secret_does_not_plan_tls_enable() {
+        let mut config = config(2, 1024);
+        let mut spec = source_spec("API_KEY", &["api.example.com"]);
+        spec.require_tls_identity = Some(false);
+        let patch = patch_with_specs(vec![spec]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(!network.tls.enabled);
+        assert!(!network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// A removal-only patch can leave another TLS-dependent secret behind.
+    /// Planning and persistence must both surface the implied TLS enable.
+    #[cfg(feature = "net")]
+    #[test]
+    fn removing_one_legacy_secret_plans_tls_for_the_remaining_secret() {
+        let mut config = config_with_secret_and_tls_disabled("KEEP", SECRET_SENTINEL);
+        let mut network = config.local_network_config().unwrap();
+        let mut removed = network.secrets.secrets[0].clone();
+        removed.env_var = "REMOVE".to_string();
+        removed.placeholder = "$MSB_REMOVE".to_string();
+        network.secrets.secrets.push(removed);
+        config.set_local_network_config(network).unwrap();
+        let patch = SandboxModificationPatch {
+            secrets_remove: vec!["REMOVE".to_string()],
+            ..SandboxModificationPatch::default()
+        };
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        assert!(validate_apply_supported(&plan).is_err());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
+        assert!(network.tls.enabled);
+    }
+
+    /// Removal-only patches that leave only plain-HTTP secrets remain live and
+    /// keep interception disabled.
+    #[cfg(feature = "net")]
+    #[test]
+    fn removing_one_plain_http_secret_keeps_tls_disabled() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("KEEP", SECRET_SENTINEL);
+        let mut network = config.local_network_config().unwrap();
+        let mut removed = network.secrets.secrets[0].clone();
+        removed.env_var = "REMOVE".to_string();
+        removed.placeholder = "$MSB_REMOVE".to_string();
+        network.secrets.secrets.push(removed);
+        config.set_local_network_config(network).unwrap();
+        let patch = SandboxModificationPatch {
+            secrets_remove: vec!["REMOVE".to_string()],
+            ..SandboxModificationPatch::default()
+        };
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+        assert!(validate_apply_supported(&plan).is_ok());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
+        assert!(!network.tls.enabled);
+    }
+
+    /// One-way: emptying the secret set must not turn interception off.
+    #[cfg(feature = "net")]
+    #[test]
+    fn removing_last_secret_keeps_tls_enabled() {
+        let mut config = config_with_secret("API_KEY", SECRET_SENTINEL);
+        let patch = SandboxModificationPatch {
+            secrets_remove: vec!["API_KEY".to_string()],
+            ..SandboxModificationPatch::default()
+        };
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Stopped,
+            &config,
+            None,
+            LiveControl::default(),
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+        assert!(tls_plan_change(&plan).is_none());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert!(network.secrets.secrets.is_empty());
+        assert!(network.tls.enabled);
+    }
+
+    /// Interception already on: nothing to enable, so no extra plan noise.
+    #[cfg(feature = "net")]
+    #[test]
+    fn secret_change_with_tls_already_enabled_plans_no_tls_change() {
+        let config = config_with_secret("API_KEY", SECRET_SENTINEL);
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &[])]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Stopped,
+            &config,
+            None,
+            LiveControl::default(),
+            patch,
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+    }
     #[cfg(feature = "net")]
     #[test]
     fn applying_new_source_spec_uses_create_placeholder_default() {
@@ -5176,6 +5627,7 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[test]
+    #[allow(deprecated)] // Both spellings must produce the existing modification contract.
     fn secret_patch_builder_builds_declarative_specs() {
         let spec = SecretPatchBuilder::new()
             .env("API_KEY")
@@ -5185,6 +5637,8 @@ mod tests {
             .placeholder("$REF")
             .allow("api.example.com")
             .allow("*.example.org")
+            .allow_placeholder_for("api.anthropic.com")
+            .allow_passthrough_for("*.anthropic.com")
             .build();
 
         assert_eq!(spec.name, "API_KEY");
@@ -5197,6 +5651,16 @@ mod tests {
         assert!(spec.value.is_empty());
         assert_eq!(spec.placeholder.as_deref(), Some("$REF"));
         assert_eq!(spec.allowed_hosts, vec!["api.example.com", "*.example.org"]);
+        assert_eq!(
+            spec.passthrough_hosts,
+            vec!["api.anthropic.com", "*.anthropic.com"]
+        );
+        let wire = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            wire["passthrough_hosts"],
+            serde_json::json!(["api.anthropic.com", "*.anthropic.com"])
+        );
+        assert!(wire.get("allow_placeholder_for").is_none());
 
         let spec = SecretPatchBuilder::new()
             .env("API_KEY")

@@ -164,8 +164,8 @@ def test_lifecycle_convergence_methods_are_typed() -> None:
 def test_restore_has_only_destination_options() -> None:
     restore = _method("restore")
     names = {arg.arg for arg in restore.args.kwonlyargs}
-    assert {"name", "forked", "disk_only", "snapshot_base", "volumes", "ports", "vsock",
-            "allow_missing_resources"} <= names
+    assert {"name", "cow_memory", "forked", "disk_only", "snapshot_base", "volumes",
+            "ports", "vsock", "allow_missing_resources"} <= names
     assert not names & {"image", "cmd", "replace", "detached", "from_snapshot", "network"}
     assert {"cpus", "memory", "network_policy", "max_connections", "disable_network",
             "security", "max_duration", "idle_timeout"} <= names
@@ -226,3 +226,20 @@ def test_disable_exec_log_defaults_off_on_every_create_method() -> None:
         assert ast.unparse(kwonly[index].annotation) == "bool", name
         default = method.args.kw_defaults[index]
         assert isinstance(default, ast.Constant) and default.value is False, name
+
+
+def test_fork_methods_retain_branch_alias_signatures() -> None:
+    classes = {
+        node.name: node
+        for node in ast.parse(STUB_PATH.read_text()).body
+        if isinstance(node, ast.ClassDef)
+    }
+    for name in ("Sandbox", "SandboxHandle"):
+        methods = {
+            node.name: node
+            for node in classes[name].body
+            if isinstance(node, ast.AsyncFunctionDef)
+        }
+        for canonical, alias in (("fork", "branch"), ("fork_many", "branch_many")):
+            assert ast.dump(methods[canonical].args) == ast.dump(methods[alias].args)
+            assert ast.dump(methods[canonical].returns) == ast.dump(methods[alias].returns)
