@@ -1101,14 +1101,6 @@ sb.detach().await;
 
 Choose whether the sandbox is created in detached/background mode. Detached sandboxes survive the creating process. Defaults to `false`.
 
-#### <span className="msb-recv">sandbox.</span><span className="msb-hn">disable_exec_log()</span>
-
-```rust
-fn disable_exec_log(self) -> Self
-```
-
-Do not record exec output to the sandbox's `exec.log` at all, not even the workload's. For workloads whose output must not reach the host's disk; `logs()` then returns nothing. Also settable for every new sandbox with `sandbox_defaults.disable_exec_log` in `config.json`.
-
 <p className="msb-label">Parameters</p>
 
 <div className="msb-params">
@@ -1117,6 +1109,14 @@ Do not record exec output to the sandbox's `exec.log` at all, not even the workl
     <div className="msb-param-desc">When <code>true</code>, create the sandbox in detached mode.</div>
   </div>
 </div>
+
+#### <span className="msb-recv">sandbox.</span><span className="msb-hn">disable_exec_log()</span>
+
+```rust
+fn disable_exec_log(self) -> Self
+```
+
+Do not record exec output to the sandbox's `exec.log` at all, not even the workload's. For workloads whose output must not reach the host's disk; `logs()` then returns nothing. Also settable for every new sandbox with `sandbox_defaults.disable_exec_log` in `config.json`.
 
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">create_detached()</span>
 

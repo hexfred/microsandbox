@@ -215,10 +215,10 @@ Stop and remove this exact sandbox. A stale handle refuses to destroy a replacem
 
 ```ruby
 sandbox.shell("./migrate.sh", capture: true)          # recorded
-sandbox.exec("env", capture: false)                   # not recorded (the default)
+sandbox.exec("env")                                   # not recorded (the default)
 ```
 
-`capture:` accepts `true`, `false`, or `nil`; `nil` or omitting it keeps the default.
+`capture:` accepts `true`, `false`, or `nil`; `nil` or omitting it keeps the default. Omit it rather than passing `false`: an explicit `false` is refused by a runtime too old to honour it, while the default works everywhere.
 
 <Tooltip tip="Applies to local sandboxes; microsandbox cloud does not accept this setting."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 

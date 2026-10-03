@@ -740,7 +740,7 @@ Allocate a pseudo-terminal
 capture(enabled)
 ```
 
-Record this command's output to the sandbox's `exec.log`, where `logs()` reads it. Default: `false`. An ad-hoc exec's output, a shell's above all, can carry anything typed or printed, so it is written to the host's disk only when asked. The sandbox's workload (`execDefault`, `execDefaultWith`, `attachDefault`, `attachDefaultWith`) is recorded without asking; pass `capture(false)` there to opt out. No effect on a sandbox built with `disableExecLog()`.
+Record this command's output to the sandbox's `exec.log`, where `logs()` reads it. Default: `false`. An ad-hoc exec's output, a shell's above all, can carry anything typed or printed, so it is written to the host's disk only when asked. `shell()` and `shellStream()` take no options and are never recorded; use `execWith` with `capture(true)` to record a script. The sandbox's workload (`execDefault`, `execDefaultWith`, `attachDefault`, `attachDefaultWith`) is recorded without asking; pass `capture(false)` there to opt out. No effect on a sandbox built with `disableExecLog()`.
 
 <p className="msb-label">Returns</p>
 
