@@ -1,6 +1,7 @@
 //! OS identity without any new runtime handshake field or persisted schema.
 
 use std::fs::File;
+use std::mem::ManuallyDrop;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -38,12 +39,27 @@ pub(in crate::backend::local) struct ProcessIdentity {
     handle: OwnedHandle,
 }
 
+/// The catalog file this backend opened, checked later for replacement.
+///
+/// **It must never close a descriptor on the catalog while SQLite has it
+/// open.** POSIX fcntl locks belong to the process and the inode, not to the
+/// descriptor: closing *any* descriptor on the file releases *every* lock
+/// this process holds on it, SQLite's included. SQLite guards against that
+/// only for descriptors it opened itself. With its locks gone, another
+/// process closing its connection believes it is the last one, checkpoints,
+/// and unlinks `-wal`/`-shm` under this process's live connections: commits
+/// made here afterwards are lost, and reads go stale or fail with
+/// `SQLITE_IOERR`/`SQLITE_NOTADB` until the process restarts.
+///
+/// So [`DatabaseIdentity::verify`] compares by path without opening the file,
+/// and the descriptor kept against inode recycling is never closed on Unix.
 pub(in crate::backend::local) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
     // Keep the original object alive so an unlinked inode/file ID cannot be
-    // recycled and mistaken for this backend's database.
-    _file: File,
+    // recycled and mistaken for this backend's database. Never closed on
+    // Unix (see the type's docs): one descriptor per bound backend.
+    _file: ManuallyDrop<File>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -176,16 +192,36 @@ impl DatabaseIdentity {
         Ok(Self {
             path: path.as_ref().to_owned(),
             id,
-            _file: file,
+            _file: ManuallyDrop::new(file),
         })
     }
 
     pub fn verify(&self) -> ControlClientResult<()> {
-        let current = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
-        if file_id(&current)? != self.id {
+        // By path, without a descriptor: opening and dropping one here would
+        // release SQLite's locks on the catalog (see the type's docs).
+        #[cfg(unix)]
+        let current = {
+            let metadata =
+                std::fs::metadata(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            (metadata.dev(), metadata.ino(), 0)
+        };
+        #[cfg(not(unix))]
+        let current =
+            file_id(&File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?)?;
+        if current != self.id {
             return Err(ControlClientError::RuntimeChanged);
         }
         Ok(())
+    }
+}
+
+impl Drop for DatabaseIdentity {
+    fn drop(&mut self) {
+        // Windows locks are per handle, so closing ours is harmless there.
+        #[cfg(not(unix))]
+        unsafe {
+            ManuallyDrop::drop(&mut self._file)
+        };
     }
 }
 

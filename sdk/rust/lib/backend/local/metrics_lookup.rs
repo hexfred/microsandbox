@@ -46,13 +46,15 @@ struct CachedMatch {
 //--------------------------------------------------------------------------------------------------
 
 impl MetricsLookup {
+    /// Captures only on the first bind: a discarded capture would close a
+    /// descriptor on the catalog and release SQLite's locks on it (see
+    /// [`DatabaseIdentity`]).
     pub(super) fn bind_database(&self, path: &Path) -> MicrosandboxResult<()> {
-        let identity = DatabaseIdentity::capture(path).map_err(metrics_error)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = &state.database {
             existing.verify().map_err(metrics_error)?;
         } else {
-            state.database = Some(identity);
+            state.database = Some(DatabaseIdentity::capture(path).map_err(metrics_error)?);
         }
         Ok(())
     }

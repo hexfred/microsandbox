@@ -62,14 +62,19 @@ struct Waiter(Arc<Entry>);
 
 impl ControlSessions {
     /// Called when this backend opens its database, not each time a path is reused.
+    ///
+    /// A second bind verifies the identity already held rather than capturing
+    /// another: capturing opens the catalog, and the discarded copy would then
+    /// close a descriptor on it (see [`DatabaseIdentity`]).
     pub fn bind_database(&self, path: &Path) -> Result<(), SharedError> {
-        let identity = Arc::new(DatabaseIdentity::capture(path).map_err(Arc::new)?);
-        let existing = self
-            .database
-            .lock()
-            .unwrap()
-            .get_or_insert(identity)
-            .clone();
+        let mut database = self.database.lock().unwrap();
+        let existing = match &*database {
+            Some(existing) => existing.clone(),
+            None => database
+                .insert(Arc::new(DatabaseIdentity::capture(path).map_err(Arc::new)?))
+                .clone(),
+        };
+        drop(database);
         existing.verify().map_err(Arc::new)?;
         Ok(())
     }

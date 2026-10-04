@@ -22,6 +22,114 @@ fn database_identity_detects_replacement_but_not_ordinary_writes() {
     ));
 }
 
+/// Binding the catalog must leave SQLite's locks on it in place.
+///
+/// POSIX fcntl locks are per process and inode, so a descriptor on `msb.db`
+/// opened and closed outside SQLite releases all of SQLite's locks. Another
+/// process closing its connection then gets the EXCLUSIVE lock it uses to
+/// decide it is the last connection, checkpoints, and unlinks `-wal`/`-shm`
+/// under this backend's live pools: this backend's later commits go to an
+/// unlinked WAL and are lost. A second process (this test binary, re-run as
+/// the child below) stands in for a VM runtime closing its catalog
+/// connection.
+#[cfg(unix)]
+#[tokio::test]
+async fn binding_the_catalog_keeps_sqlite_locks_held() {
+    use sea_orm::ConnectionTrait;
+
+    const CHILD: &str = "MSB_TEST_CATALOG_LOCK_CHILD";
+    const TEST: &str =
+        "backend::local::control::tests::binding_the_catalog_keeps_sqlite_locks_held";
+    if let Some(job) = std::env::var_os(CHILD) {
+        let job = job.into_string().unwrap();
+        let (mode, path) = job.split_once(':').unwrap();
+        let pools = microsandbox_db::pool::DbPools::open(
+            std::path::Path::new(path),
+            1,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        if mode == "write" {
+            pools
+                .write()
+                .execute_unprepared("CREATE TABLE IF NOT EXISTS lock_probe (x)")
+                .await
+                .unwrap();
+        } else {
+            let row = pools
+                .read()
+                .query_one_raw(sea_orm::Statement::from_string(
+                    sea_orm::DbBackend::Sqlite,
+                    "SELECT count(*) AS n FROM sqlite_master WHERE name = 'parent_commit'",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            println!(
+                "parent commit visible: {}",
+                row.try_get::<i64>("", "n").unwrap()
+            );
+        }
+        // A clean close is what runs SQLite's last-connection check.
+        pools.read().inner().close_by_ref().await.unwrap();
+        pools.write().inner().close_by_ref().await.unwrap();
+        println!("catalog child done");
+        return;
+    }
+    let child = |mode: &str, path: &std::path::Path| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, format!("{mode}:{}", path.display()))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && stdout.contains("catalog child done"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let backend = crate::backend::LocalBackend::builder()
+        .home(home.path())
+        .build()
+        .await
+        .unwrap();
+    let pools = backend.db().await.unwrap();
+    let path = home
+        .path()
+        .join(microsandbox_utils::DB_SUBDIR)
+        .join(microsandbox_utils::DB_FILENAME);
+    // A second bind must not open another descriptor either.
+    backend.control_sessions.bind_database(&path).unwrap();
+    backend.metrics_lookup.bind_database(&path).unwrap();
+    let probe = "SELECT count(*) FROM sqlite_master";
+    pools.read().execute_unprepared(probe).await.unwrap();
+    pools.write().execute_unprepared(probe).await.unwrap();
+
+    child("write", &path);
+    let side = |suffix: &str| path.with_file_name(format!("msb.db{suffix}")).exists();
+    assert!(
+        side("-wal") && side("-shm"),
+        "another process closing its connection unlinked this backend's live WAL \
+         (wal: {}, shm: {}): the backend no longer holds its SQLite locks",
+        side("-wal"),
+        side("-shm")
+    );
+
+    // And what the backend commits now reaches the shared catalog.
+    pools
+        .write()
+        .execute_unprepared("CREATE TABLE parent_commit (x)")
+        .await
+        .unwrap();
+    assert!(child("read", &path).contains("parent commit visible: 1"));
+}
+
 #[cfg(unix)]
 mod unix {
     use futures::FutureExt;
